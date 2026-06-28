@@ -13,7 +13,17 @@ chmod +x install.sh start.sh
 bash install.sh
 ```
 
-安装脚本会创建 `.venv`、安装服务依赖，并尝试从 GitHub Releases 下载默认 wav2wav ONNX 模型到 `onnx/fastenhancer_t.onnx`。如果 `pip` 下载失败，脚本会自动清除代理环境变量后重试。也可以通过 `MODEL_URL=... bash install.sh` 指定模型下载地址。
+默认下载 FastEnhancer_T。也可以用 `--model` 指定 T/B/S/M/L 五种 wav2wav ONNX 模型：
+
+```bash
+bash install.sh --model t
+bash install.sh --model b
+bash install.sh --model s
+bash install.sh --model m
+bash install.sh --model l
+```
+
+安装脚本会创建 `.venv`、安装服务依赖，并尝试从 GitHub Releases 下载模型到 `onnx/fastenhancer_<model>.onnx`。如果 `pip` 下载失败，脚本会自动清除代理环境变量后重试。也可以通过 `MODEL_URL=... bash install.sh` 指定模型下载地址。
 
 ## 服务启动
 

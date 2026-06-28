@@ -7,7 +7,63 @@ cd "${ROOT_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV_DIR="${VENV_DIR:-.venv}"
 MODEL_DIR="${MODEL_DIR:-onnx}"
+
+usage() {
+  cat <<'EOF'
+Usage: bash install.sh [--model t|b|s|m|l]
+
+Options:
+  --model MODEL  Download FastEnhancer MODEL. Accepts t, b, s, m, l,
+                 FastEnhancer_T, or fastenhancer_t.onnx forms.
+  -h, --help     Show this help.
+EOF
+}
+
+normalize_model_name() {
+  local value="${1,,}"
+  value="${value//-/_}"
+  value="${value%.onnx}"
+  value="${value#fastenhancer_}"
+  case "${value}" in
+    t|b|s|m|l) printf 'fastenhancer_%s.onnx\n' "${value}" ;;
+    *)
+      echo "Unsupported model: $1. Expected one of: t, b, s, m, l." >&2
+      return 1
+      ;;
+  esac
+}
+
+MODEL_ARG=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model)
+      if [[ $# -lt 2 ]]; then
+        echo "--model requires a value." >&2
+        exit 1
+      fi
+      MODEL_ARG="$2"
+      shift 2
+      ;;
+    --model=*)
+      MODEL_ARG="${1#--model=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
 MODEL_NAME="${MODEL_NAME:-fastenhancer_t.onnx}"
+if [[ -n "${MODEL_ARG}" ]]; then
+  MODEL_NAME="$(normalize_model_name "${MODEL_ARG}")"
+fi
 MODEL_PATH="${ONNX_PATH:-${MODEL_DIR}/${MODEL_NAME}}"
 
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
@@ -71,11 +127,11 @@ sample_rate = int(sys.argv[2])
 api = "https://api.github.com/repos/aask1357/fastenhancer/releases"
 
 fallbacks_16k = [
-    "https://github.com/aask1357/fastenhancer/releases/download/onnx-vd-v1.0.0/fastenhancer_t.onnx",
-    "https://github.com/aask1357/fastenhancer/releases/download/onnx-dns-v1.0.0/fastenhancer_t.onnx",
+    f"https://github.com/aask1357/fastenhancer/releases/download/onnx-vd-v1.0.0/{model_name}",
+    f"https://github.com/aask1357/fastenhancer/releases/download/onnx-dns-v1.0.0/{model_name}",
 ]
 fallbacks_48k = [
-    "https://github.com/aask1357/fastenhancer/releases/download/onnx-48khz-v1/fastenhancer_t.onnx",
+    f"https://github.com/aask1357/fastenhancer/releases/download/onnx-48khz-v1/{model_name}",
 ]
 
 def read_releases():
@@ -138,9 +194,9 @@ PYURL
 
   echo "Downloading ${model_url} -> ${MODEL_PATH}"
   if command -v curl >/dev/null 2>&1; then
-    curl -L --fail --retry 2 --connect-timeout 20 -o "${tmp_path}" "${model_url}"
+    curl -L --fail --retry 2 --connect-timeout 20 -o "${tmp_path}" "${model_url}" || return 1
   else
-    python - "$model_url" "$tmp_path" <<'PYFETCH'
+    python - "$model_url" "$tmp_path" <<'PYFETCH' || return 1
 import sys
 import urllib.request
 url, target = sys.argv[1], sys.argv[2]
@@ -158,10 +214,12 @@ if download_model; then
   echo "Downloaded ONNX model: ${MODEL_PATH}"
 else
   echo "Model download failed; retrying with proxy environment variables unset..."
-  (
+  if (
     unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
     download_model
-  )
+  ); then
+    echo "Downloaded ONNX model: ${MODEL_PATH}"
+  fi
 fi
 
 echo "Install complete."
