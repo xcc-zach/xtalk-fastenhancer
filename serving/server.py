@@ -10,9 +10,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal
 
-import librosa
 import numpy as np
 import onnxruntime
+from scipy import signal
 import soundfile as sf
 import uvicorn
 import wave
@@ -35,6 +35,7 @@ REALTIME_FRAME_SAMPLES = 512
 REALTIME_FRAME_BYTES = REALTIME_FRAME_SAMPLES * 2
 REALTIME_ENCODING = "pcm_s16le"
 REALTIME_CHANNELS = 1
+REALTIME_MAX_PENDING_FRAMES = int(os.environ.get("REALTIME_MAX_PENDING_FRAMES", "16"))
 
 
 @dataclass
@@ -127,11 +128,20 @@ class Wav2WavEnhancer:
                 f"realtime websocket requires service sample_rate={REALTIME_SAMPLE_RATE}; "
                 f"got sample_rate={self.config.sample_rate}"
             )
-        if self.input_size != REALTIME_FRAME_SAMPLES or self.output_size != REALTIME_FRAME_SAMPLES:
+        if self.input_size != REALTIME_FRAME_SAMPLES:
             raise ValueError(
-                "realtime websocket requires ONNX wav_in and wav_out frame size of "
-                f"{REALTIME_FRAME_SAMPLES} samples; got input_size={self.input_size}, "
-                f"output_size={self.output_size}"
+                "realtime websocket requires ONNX wav_in frame size of "
+                f"{REALTIME_FRAME_SAMPLES} samples; got input_size={self.input_size}"
+            )
+        if self.output_size <= 0 or self.output_size > REALTIME_FRAME_SAMPLES:
+            raise ValueError(
+                "realtime websocket requires ONNX wav_out frame size between 1 and "
+                f"{REALTIME_FRAME_SAMPLES} samples; got output_size={self.output_size}"
+            )
+        if REALTIME_FRAME_SAMPLES % self.output_size:
+            raise ValueError(
+                "realtime websocket requires frame_samples to be divisible by ONNX wav_out "
+                f"frame size; got frame_samples={REALTIME_FRAME_SAMPLES}, output_size={self.output_size}"
             )
         return RealtimeStreamState(self)
 
@@ -143,19 +153,38 @@ class RealtimeStreamState:
 
     def reset(self) -> None:
         self.onnx_input = self.enhancer._empty_cache()
+        self.pending_input = np.empty(0, dtype=np.float32)
+        self.pending_output = np.empty(0, dtype=np.float32)
         self.is_first_frame = True
 
     def process_frame(self, pcm: bytes) -> bytes:
         if len(pcm) != REALTIME_FRAME_BYTES:
             raise ValueError(f"expected exactly {REALTIME_FRAME_BYTES} bytes")
         wav = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
-        self.onnx_input["wav_in"] = wav.reshape(1, REALTIME_FRAME_SAMPLES)
-        out = self.enhancer.session.run(None, self.onnx_input)
-        for cache_idx, cache_value in enumerate(out[1:]):
-            self.onnx_input[f"cache_in_{cache_idx}"] = cache_value
-        self.is_first_frame = False
-        enhanced = np.asarray(out[0][0], dtype=np.float32)
+        self.pending_input = np.concatenate([self.pending_input, wav])
+
+        while self.pending_input.size >= self.enhancer.input_size:
+            self.onnx_input["wav_in"] = self.pending_input[: self.enhancer.input_size].reshape(1, -1)
+            out = self.enhancer.session.run(None, self.onnx_input)
+            for cache_idx, cache_value in enumerate(out[1:]):
+                self.onnx_input[f"cache_in_{cache_idx}"] = cache_value
+            self.pending_output = np.concatenate(
+                [self.pending_output, np.asarray(out[0][0], dtype=np.float32)]
+            )
+            self.pending_input = self.pending_input[self.enhancer.output_size :]
+            self.is_first_frame = False
+
+        if self.pending_output.size >= REALTIME_FRAME_SAMPLES:
+            enhanced = self.pending_output[:REALTIME_FRAME_SAMPLES]
+            self.pending_output = self.pending_output[REALTIME_FRAME_SAMPLES:]
+        else:
+            missing = REALTIME_FRAME_SAMPLES - self.pending_output.size
+            enhanced = np.concatenate([np.zeros(missing, dtype=np.float32), self.pending_output])
+            self.pending_output = np.empty(0, dtype=np.float32)
         return float_to_pcm16(enhanced)
+
+    def process_frames(self, frames: list[bytes]) -> list[bytes]:
+        return [self.process_frame(frame) for frame in frames]
 
 
 def decode_audio_file(data: bytes, target_sr: int) -> np.ndarray:
@@ -166,7 +195,8 @@ def decode_audio_file(data: bytes, target_sr: int) -> np.ndarray:
     if wav.ndim > 1:
         wav = np.mean(wav, axis=1)
     if sr != target_sr:
-        wav = librosa.resample(wav, orig_sr=sr, target_sr=target_sr)
+        gcd = math.gcd(int(sr), int(target_sr))
+        wav = signal.resample_poly(wav, target_sr // gcd, sr // gcd)
     return np.asarray(wav, dtype=np.float32)
 
 
@@ -208,10 +238,10 @@ def create_app(config: ServiceConfig) -> FastAPI:
         async with semaphore:
             return await loop.run_in_executor(executor, enhancer.enhance, wav)
 
-    async def run_realtime_frame(state: RealtimeStreamState, pcm: bytes) -> bytes:
+    async def run_realtime_frames(state: RealtimeStreamState, frames: list[bytes]) -> list[bytes]:
         loop = asyncio.get_running_loop()
         async with semaphore:
-            return await loop.run_in_executor(executor, state.process_frame, pcm)
+            return await loop.run_in_executor(executor, state.process_frames, frames)
 
     def realtime_spec() -> dict[str, object]:
         return {
@@ -286,6 +316,76 @@ def create_app(config: ServiceConfig) -> FastAPI:
         await websocket.accept()
         state: RealtimeStreamState | None = None
         started = False
+        generation = 0
+        frame_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(
+            maxsize=REALTIME_MAX_PENDING_FRAMES
+        )
+        state_lock = asyncio.Lock()
+        send_lock = asyncio.Lock()
+
+        async def send_error(code: str, message: str) -> None:
+            async with send_lock:
+                await send_ws_error(websocket, code, message)
+
+        async def process_queued_frames() -> None:
+            nonlocal generation
+            pending_item: tuple[int, bytes] | None = None
+            while True:
+                if pending_item is None:
+                    item = await frame_queue.get()
+                else:
+                    item = pending_item
+                    pending_item = None
+                if item is None:
+                    return
+
+                frame_generation, pcm = item
+                current_state = state
+                if current_state is None:
+                    continue
+
+                frames = [pcm]
+                stop_after_batch = False
+                while len(frames) < REALTIME_MAX_PENDING_FRAMES:
+                    try:
+                        queued_item = frame_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if queued_item is None:
+                        stop_after_batch = True
+                        break
+                    queued_generation, queued_pcm = queued_item
+                    if queued_generation != frame_generation:
+                        pending_item = queued_item
+                        break
+                    frames.append(queued_pcm)
+
+                try:
+                    async with state_lock:
+                        if frame_generation != generation:
+                            continue
+                        enhanced_frames = await run_realtime_frames(current_state, frames)
+                except Exception as exc:
+                    await send_error("inference_failed", str(exc))
+                    continue
+
+                if frame_generation != generation:
+                    continue
+                async with send_lock:
+                    for enhanced in enhanced_frames:
+                        await websocket.send_bytes(enhanced)
+                if stop_after_batch:
+                    return
+
+        processor_task = asyncio.create_task(process_queued_frames())
+
+        def drain_queued_frames() -> None:
+            while True:
+                try:
+                    frame_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+
         try:
             while True:
                 msg = await websocket.receive()
@@ -297,67 +397,73 @@ def create_app(config: ServiceConfig) -> FastAPI:
                     try:
                         payload = json.loads(text)
                     except json.JSONDecodeError:
-                        await send_ws_error(websocket, "invalid_json", "control message must be valid JSON")
+                        await send_error("invalid_json", "control message must be valid JSON")
                         continue
                     if not isinstance(payload, dict):
-                        await send_ws_error(websocket, "invalid_control", "control message must be a JSON object")
+                        await send_error("invalid_control", "control message must be a JSON object")
                         continue
 
                     msg_type = payload.get("type")
                     if msg_type == "start":
                         if started:
-                            await send_ws_error(websocket, "already_started", "stream already started")
+                            await send_error("already_started", "stream already started")
                             continue
                         validation_error = validate_start_message(payload)
                         if validation_error is not None:
-                            await send_ws_error(websocket, "invalid_start", validation_error)
+                            await send_error("invalid_start", validation_error)
                             continue
                         try:
                             state = enhancer.create_realtime_stream()
                         except ValueError as exc:
-                            await send_ws_error(websocket, "unsupported_model_frame_size", str(exc))
+                            await send_error("unsupported_model_frame_size", str(exc))
                             continue
                         started = True
-                        await websocket.send_json({"type": "start_ack", **realtime_spec()})
+                        async with send_lock:
+                            await websocket.send_json({"type": "start_ack", **realtime_spec()})
                     elif msg_type == "reset":
                         if state is None:
-                            await send_ws_error(websocket, "not_started", "send start before reset")
+                            await send_error("not_started", "send start before reset")
                             continue
-                        state.reset()
-                        await websocket.send_json({"type": "reset_ack"})
+                        generation += 1
+                        drain_queued_frames()
+                        async with state_lock:
+                            state.reset()
+                        async with send_lock:
+                            await websocket.send_json({"type": "reset_ack"})
                     elif msg_type == "flush":
                         if not started:
-                            await send_ws_error(websocket, "not_started", "send start before flush")
+                            await send_error("not_started", "send start before flush")
                             continue
-                        await websocket.send_json({"type": "flush_ack"})
+                        async with send_lock:
+                            await websocket.send_json({"type": "flush_ack"})
                     elif msg_type == "close":
                         await websocket.close()
                         break
                     else:
-                        await send_ws_error(websocket, "unknown_control", "unknown control message type")
+                        await send_error("unknown_control", "unknown control message type")
                     continue
 
                 pcm = msg.get("bytes")
                 if pcm is None:
                     continue
                 if state is None:
-                    await send_ws_error(websocket, "not_started", "send start before binary audio frames")
+                    await send_error("not_started", "send start before binary audio frames")
                     continue
                 if len(pcm) != REALTIME_FRAME_BYTES:
-                    await send_ws_error(
-                        websocket,
+                    await send_error(
                         "invalid_frame_size",
                         f"expected exactly {REALTIME_FRAME_BYTES} bytes",
                     )
                     continue
-                try:
-                    enhanced = await run_realtime_frame(state, pcm)
-                except Exception as exc:
-                    await send_ws_error(websocket, "inference_failed", str(exc))
-                    continue
-                await websocket.send_bytes(enhanced)
+                await frame_queue.put((generation, pcm))
         except WebSocketDisconnect:
             pass
+        finally:
+            processor_task.cancel()
+            try:
+                await processor_task
+            except asyncio.CancelledError:
+                pass
 
     return app
 
