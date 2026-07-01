@@ -78,6 +78,44 @@ curl -X POST "http://localhost:8000/v1/enhance/pcm?input_dtype=int16&response_fo
 
 `input_dtype` 也支持 `float32`。`response_format` 支持 `pcm` 或 `wav`。
 
+### 实时 WebSocket 增强
+
+Endpoint：
+
+```text
+ws://localhost:8000/ws/fastenhancer/realtime
+```
+
+一条 WebSocket 连接对应一个音频流。连接后先发送 JSON start：
+
+```json
+{
+  "type": "start",
+  "sample_rate": 16000,
+  "frame_samples": 512,
+  "encoding": "pcm_s16le",
+  "channels": 1
+}
+```
+
+服务端返回 `start_ack` 后进入 binary streaming 模式。客户端每次发送一个完整 1024 bytes 的 mono little-endian PCM16 frame，服务端每收到一帧就返回一个完整 1024 bytes 的增强后 PCM16 binary frame。音频帧不带 JSON header、不使用 base64、不携带 seq。
+
+控制消息：
+
+- `{ "type": "reset" }`：清零本连接 ONNX cache，返回 `{ "type": "reset_ack" }`
+- `{ "type": "flush" }`：固定帧模式下直接返回 `{ "type": "flush_ack" }`
+- `{ "type": "close" }`：服务端关闭连接
+
+如果 binary frame 不是 1024 bytes，服务端返回：
+
+```json
+{
+  "type": "error",
+  "code": "invalid_frame_size",
+  "message": "expected exactly 1024 bytes"
+}
+```
+
 ## 压测
 
 ### 运行

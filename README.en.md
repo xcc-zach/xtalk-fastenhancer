@@ -68,6 +68,44 @@ curl -X POST "http://localhost:8000/v1/enhance/pcm?input_dtype=int16&response_fo
 
 `input_dtype` also supports `float32`. `response_format` supports `pcm` or `wav`.
 
+### Realtime WebSocket Enhancement
+
+Endpoint:
+
+```text
+ws://localhost:8000/ws/fastenhancer/realtime
+```
+
+One WebSocket connection represents one audio stream. After connecting, send a JSON start message:
+
+```json
+{
+  "type": "start",
+  "sample_rate": 16000,
+  "frame_samples": 512,
+  "encoding": "pcm_s16le",
+  "channels": 1
+}
+```
+
+After the server returns `start_ack`, the connection enters binary streaming mode. The client sends one complete 1024-byte mono little-endian PCM16 frame at a time, and the server returns one complete 1024-byte enhanced PCM16 binary frame for each received frame. Audio frames have no JSON header, no base64 encoding, and no seq metadata.
+
+Control messages:
+
+- `{ "type": "reset" }`: clears the per-connection ONNX cache and returns `{ "type": "reset_ack" }`
+- `{ "type": "flush" }`: returns `{ "type": "flush_ack" }` in fixed-frame mode
+- `{ "type": "close" }`: closes the connection from the server side
+
+If a binary frame is not exactly 1024 bytes, the server returns:
+
+```json
+{
+  "type": "error",
+  "code": "invalid_frame_size",
+  "message": "expected exactly 1024 bytes"
+}
+```
+
 ## Performance Testing
 
 ### Run

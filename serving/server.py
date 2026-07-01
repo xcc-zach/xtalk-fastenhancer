@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import io
+import json
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -15,11 +16,25 @@ import onnxruntime
 import soundfile as sf
 import uvicorn
 import wave
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import Response
 
 
 PCMDType = Literal["int16", "float32"]
+REALTIME_SAMPLE_RATE = 16000
+REALTIME_FRAME_SAMPLES = 512
+REALTIME_FRAME_BYTES = REALTIME_FRAME_SAMPLES * 2
+REALTIME_ENCODING = "pcm_s16le"
+REALTIME_CHANNELS = 1
 
 
 @dataclass
@@ -81,7 +96,6 @@ class Wav2WavEnhancer:
         return cache
 
     def enhance(self, wav: np.ndarray) -> np.ndarray:
-        cfg = self.config
         wav = np.asarray(wav, dtype=np.float32)
         if wav.ndim > 1:
             wav = np.mean(wav, axis=1)
@@ -106,6 +120,42 @@ class Wav2WavEnhancer:
         enhanced = np.concatenate(chunks, axis=0)
         enhanced = enhanced[self.delay : self.delay + length]
         return np.clip(enhanced, -1.0, 1.0).astype(np.float32, copy=False)
+
+    def create_realtime_stream(self) -> "RealtimeStreamState":
+        if self.config.sample_rate != REALTIME_SAMPLE_RATE:
+            raise ValueError(
+                f"realtime websocket requires service sample_rate={REALTIME_SAMPLE_RATE}; "
+                f"got sample_rate={self.config.sample_rate}"
+            )
+        if self.input_size != REALTIME_FRAME_SAMPLES or self.output_size != REALTIME_FRAME_SAMPLES:
+            raise ValueError(
+                "realtime websocket requires ONNX wav_in and wav_out frame size of "
+                f"{REALTIME_FRAME_SAMPLES} samples; got input_size={self.input_size}, "
+                f"output_size={self.output_size}"
+            )
+        return RealtimeStreamState(self)
+
+
+class RealtimeStreamState:
+    def __init__(self, enhancer: Wav2WavEnhancer) -> None:
+        self.enhancer = enhancer
+        self.reset()
+
+    def reset(self) -> None:
+        self.onnx_input = self.enhancer._empty_cache()
+        self.is_first_frame = True
+
+    def process_frame(self, pcm: bytes) -> bytes:
+        if len(pcm) != REALTIME_FRAME_BYTES:
+            raise ValueError(f"expected exactly {REALTIME_FRAME_BYTES} bytes")
+        wav = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        self.onnx_input["wav_in"] = wav.reshape(1, REALTIME_FRAME_SAMPLES)
+        out = self.enhancer.session.run(None, self.onnx_input)
+        for cache_idx, cache_value in enumerate(out[1:]):
+            self.onnx_input[f"cache_in_{cache_idx}"] = cache_value
+        self.is_first_frame = False
+        enhanced = np.asarray(out[0][0], dtype=np.float32)
+        return float_to_pcm16(enhanced)
 
 
 def decode_audio_file(data: bytes, target_sr: int) -> np.ndarray:
@@ -158,6 +208,33 @@ def create_app(config: ServiceConfig) -> FastAPI:
         async with semaphore:
             return await loop.run_in_executor(executor, enhancer.enhance, wav)
 
+    async def run_realtime_frame(state: RealtimeStreamState, pcm: bytes) -> bytes:
+        loop = asyncio.get_running_loop()
+        async with semaphore:
+            return await loop.run_in_executor(executor, state.process_frame, pcm)
+
+    def realtime_spec() -> dict[str, object]:
+        return {
+            "sample_rate": REALTIME_SAMPLE_RATE,
+            "frame_samples": REALTIME_FRAME_SAMPLES,
+            "encoding": REALTIME_ENCODING,
+            "channels": REALTIME_CHANNELS,
+        }
+
+    def validate_start_message(payload: dict[str, object]) -> str | None:
+        expected = realtime_spec()
+        for key, value in expected.items():
+            if payload.get(key) != value:
+                return f"{key} must be {value!r}"
+        return None
+
+    async def send_ws_error(websocket: WebSocket, code: str, message: str) -> None:
+        await websocket.send_json({"type": "error", "code": code, "message": message})
+
+    @app.on_event("shutdown")
+    async def shutdown_executor() -> None:
+        executor.shutdown(wait=False, cancel_futures=True)
+
     @app.get("/health")
     async def health() -> dict[str, object]:
         return {
@@ -203,6 +280,84 @@ def create_app(config: ServiceConfig) -> FastAPI:
         if response_format == "wav":
             return Response(encode_wav(enhanced, config.sample_rate), media_type="audio/wav")
         return Response(float_to_pcm16(enhanced), media_type="application/octet-stream")
+
+    @app.websocket("/ws/fastenhancer/realtime")
+    async def realtime_websocket(websocket: WebSocket) -> None:
+        await websocket.accept()
+        state: RealtimeStreamState | None = None
+        started = False
+        try:
+            while True:
+                msg = await websocket.receive()
+                if msg["type"] == "websocket.disconnect":
+                    break
+
+                text = msg.get("text")
+                if text is not None:
+                    try:
+                        payload = json.loads(text)
+                    except json.JSONDecodeError:
+                        await send_ws_error(websocket, "invalid_json", "control message must be valid JSON")
+                        continue
+                    if not isinstance(payload, dict):
+                        await send_ws_error(websocket, "invalid_control", "control message must be a JSON object")
+                        continue
+
+                    msg_type = payload.get("type")
+                    if msg_type == "start":
+                        if started:
+                            await send_ws_error(websocket, "already_started", "stream already started")
+                            continue
+                        validation_error = validate_start_message(payload)
+                        if validation_error is not None:
+                            await send_ws_error(websocket, "invalid_start", validation_error)
+                            continue
+                        try:
+                            state = enhancer.create_realtime_stream()
+                        except ValueError as exc:
+                            await send_ws_error(websocket, "unsupported_model_frame_size", str(exc))
+                            continue
+                        started = True
+                        await websocket.send_json({"type": "start_ack", **realtime_spec()})
+                    elif msg_type == "reset":
+                        if state is None:
+                            await send_ws_error(websocket, "not_started", "send start before reset")
+                            continue
+                        state.reset()
+                        await websocket.send_json({"type": "reset_ack"})
+                    elif msg_type == "flush":
+                        if not started:
+                            await send_ws_error(websocket, "not_started", "send start before flush")
+                            continue
+                        await websocket.send_json({"type": "flush_ack"})
+                    elif msg_type == "close":
+                        await websocket.close()
+                        break
+                    else:
+                        await send_ws_error(websocket, "unknown_control", "unknown control message type")
+                    continue
+
+                pcm = msg.get("bytes")
+                if pcm is None:
+                    continue
+                if state is None:
+                    await send_ws_error(websocket, "not_started", "send start before binary audio frames")
+                    continue
+                if len(pcm) != REALTIME_FRAME_BYTES:
+                    await send_ws_error(
+                        websocket,
+                        "invalid_frame_size",
+                        f"expected exactly {REALTIME_FRAME_BYTES} bytes",
+                    )
+                    continue
+                try:
+                    enhanced = await run_realtime_frame(state, pcm)
+                except Exception as exc:
+                    await send_ws_error(websocket, "inference_failed", str(exc))
+                    continue
+                await websocket.send_bytes(enhanced)
+        except WebSocketDisconnect:
+            pass
 
     return app
 
